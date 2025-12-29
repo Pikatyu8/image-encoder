@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-Улучшенный Пиксельный Кодировщик v2.0
+PixelEncoder v3.1
 
-Исправленные уязвимости:
-✅ Salt (16 байт) - защита от радужных таблиц
-✅ PBKDF2 (200000 итераций) - замедление брутфорса  
-✅ Случайный Nonce/IV (12 байт) - уникальный поток при одном пароле
-✅ AES-256-GCM вместо самописного XOR
-✅ Встроенная аутентификация (AEAD) - обнаружение модификаций
-✅ Длина данных зашифрована внутри блока
-✅ Случайный padding - маскировка точного размера
+Исправления:
+✅ Автогенерация пароля при пустом вводе
+✅ Лимит MAX_ITERATIONS (защита от зависания)
+✅ Улучшенный вывод сгенерированного пароля
 """
 
 import math
 import struct
 import secrets
+import sys
+import os
 from PIL import Image
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -25,69 +23,58 @@ from typing import Tuple, Optional
 #                    КОНСТАНТЫ БЕЗОПАСНОСТИ
 # ══════════════════════════════════════════════════════════════
 
-SALT_SIZE = 16              # Соль для PBKDF2
-NONCE_SIZE = 12             # IV для AES-GCM (рекомендуемый размер)
-KEY_SIZE = 32               # AES-256
-PBKDF2_ITERATIONS = 200_000 # Итерации (замедляет перебор ~0.5-1 сек)
-FORMAT_VERSION = 2          # Версия формата для совместимости
-MAX_PADDING = 256           # Максимальный случайный padding
-
+SALT_SIZE = 16              
+NONCE_SIZE = 12             
+KEY_SIZE = 32               
+MIN_ITERATIONS = 200_000
+MAX_ITERATIONS = 5_000_000  # ~15-30 сек, защита от зависания
+DEFAULT_ITERATIONS = 200_000
+FORMAT_VERSION = 3
+MAX_PADDING = 256           
 
 # ══════════════════════════════════════════════════════════════
 #                    КРИПТОГРАФИЧЕСКИЕ ФУНКЦИИ
 # ══════════════════════════════════════════════════════════════
 
-def derive_key(password: str, salt: bytes) -> bytes:
-    """
-    Генерация криптографического ключа из пароля.
-    
-    PBKDF2-HMAC-SHA256:
-    - Замедляет перебор паролей (~200k хешей на 1 попытку)
-    - Соль делает бесполезными радужные таблицы
-    """
+def derive_key(password: str, salt: bytes, iterations: int) -> bytes:
+    """Генерация ключа с переменным числом итераций."""
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=KEY_SIZE,
         salt=salt,
-        iterations=PBKDF2_ITERATIONS,
+        iterations=iterations,
     )
     return kdf.derive(password.encode('utf-8'))
 
 
-def encrypt_data(data: bytes, password: str) -> bytes:
+def encrypt_data(data: bytes, password: str, extension: str, iterations: int) -> bytes:
     """
-    Шифрование с AES-256-GCM.
-    
-    Формат вывода (открыто):
-    ┌─────────┬──────────┬───────────┬────────────────┬─────────────┐
-    │ VER (1) │ SALT(16) │ NONCE(12) │ CIPHER_LEN (4) │ CIPHERTEXT  │
-    └─────────┴──────────┴───────────┴────────────────┴─────────────┘
-    
-    Внутри ciphertext (зашифровано + аутентифицировано):
-    ┌──────────────┬──────────┬────────────────────┬─────────┐
-    │ DATA_LEN (4) │ DATA (N) │ RANDOM_PADDING (?) │ TAG(16) │
-    └──────────────┴──────────┴────────────────────┴─────────┘
+    Шифрование данных + расширения файла.
     """
-    # Генерируем уникальные параметры для каждого шифрования
+    ext_bytes = extension.encode('utf-8')
+    if len(ext_bytes) > 255:
+        ext_bytes = ext_bytes[:255]
+    
     salt = secrets.token_bytes(SALT_SIZE)
     nonce = secrets.token_bytes(NONCE_SIZE)
-    key = derive_key(password, salt)
+    key = derive_key(password, salt, iterations)
     
-    # Случайный padding маскирует точный размер данных
     padding_size = secrets.randbelow(MAX_PADDING)
+    
     inner_data = (
-        struct.pack('<I', len(data)) +  # Длина (зашифрована!)
+        struct.pack('<B', len(ext_bytes)) +
+        ext_bytes +
+        struct.pack('<I', len(data)) +
         data + 
         secrets.token_bytes(padding_size)
     )
     
-    # AES-GCM: шифрование + аутентификация одновременно
     aesgcm = AESGCM(key)
-    ciphertext = aesgcm.encrypt(nonce, inner_data, None)  # Включает 16-байт тег
+    ciphertext = aesgcm.encrypt(nonce, inner_data, None)
     
-    # Собираем пакет
     return (
         struct.pack('<B', FORMAT_VERSION) +
+        struct.pack('<I', iterations) +
         salt +
         nonce +
         struct.pack('<I', len(ciphertext)) +
@@ -95,83 +82,68 @@ def encrypt_data(data: bytes, password: str) -> bytes:
     )
 
 
-def decrypt_data(encrypted: bytes, password: str) -> Tuple[Optional[bytes], Optional[str]]:
+def decrypt_data(encrypted: bytes, password: str) -> Tuple[Optional[bytes], str, Optional[str]]:
     """
-    Расшифровка с проверкой целостности.
-    
-    Возвращает:
-        (данные, None) - успех
-        (None, сообщение_об_ошибке) - ошибка
+    Возвращает: (данные, расширение_файла, ошибка)
     """
-    # Минимальный размер: версия + соль + nonce + длина + тег
-    min_size = 1 + SALT_SIZE + NONCE_SIZE + 4 + 16
+    min_size = 1 + 4 + SALT_SIZE + NONCE_SIZE + 4 + 16
     if len(encrypted) < min_size:
-        return None, "Данные слишком короткие или повреждены"
+        return None, "", "Данные слишком короткие или повреждены"
     
-    # Парсим заголовок
-    version = encrypted[0]
+    offset = 0
+    version = encrypted[offset]; offset += 1
+    
     if version != FORMAT_VERSION:
-        if version == 0 or version == 1:
-            return None, "Файл создан старой версией программы (несовместимо)"
-        return None, f"Неизвестная версия формата: {version}"
+        return None, "", f"Версия формата ({version}) не поддерживается (нужна v{FORMAT_VERSION})."
     
-    offset = 1
+    iterations = struct.unpack('<I', encrypted[offset:offset+4])[0]; offset += 4
     salt = encrypted[offset:offset + SALT_SIZE]; offset += SALT_SIZE
     nonce = encrypted[offset:offset + NONCE_SIZE]; offset += NONCE_SIZE
     ciphertext_len = struct.unpack('<I', encrypted[offset:offset + 4])[0]; offset += 4
     
     if offset + ciphertext_len > len(encrypted):
-        return None, "Повреждённый заголовок: указанная длина превышает размер данных"
+        return None, "", "Повреждённый заголовок: длина данных не совпадает."
     
     ciphertext = encrypted[offset:offset + ciphertext_len]
-    
-    # Генерируем ключ (занимает ~0.5 сек)
-    key = derive_key(password, salt)
+    key = derive_key(password, salt, iterations)
     
     try:
-        # Расшифровка + проверка аутентификации
         aesgcm = AESGCM(key)
         inner_data = aesgcm.decrypt(nonce, ciphertext, None)
         
-        # Извлекаем данные
-        if len(inner_data) < 4:
-            return None, "Внутренняя ошибка: слишком короткие расшифрованные данные"
+        ptr = 0
+        ext_len = inner_data[ptr]; ptr += 1
+        extension = inner_data[ptr:ptr+ext_len].decode('utf-8'); ptr += ext_len
+        data_len = struct.unpack('<I', inner_data[ptr:ptr+4])[0]; ptr += 4
+        
+        if len(inner_data) < ptr + data_len:
+            return None, "", "Ошибка целостности внутренней структуры."
             
-        data_len = struct.unpack('<I', inner_data[:4])[0]
-        
-        if data_len > len(inner_data) - 4:
-            return None, "Внутренняя ошибка: неверная длина данных"
-        
-        return inner_data[4:4 + data_len], None
+        final_data = inner_data[ptr:ptr+data_len]
+        return final_data, extension, None
         
     except Exception:
-        # GCM не расшифрует если пароль неверный ИЛИ данные изменены
-        return None, "Неверный пароль или данные повреждены/изменены"
+        return None, "", "Неверный пароль или данные повреждены."
 
 
 # ══════════════════════════════════════════════════════════════
 #                    РАБОТА С ИЗОБРАЖЕНИЯМИ
 # ══════════════════════════════════════════════════════════════
 
-def encode_data_to_image(data_bytes: bytes, password: str, output_filename: str = "encoded.png"):
-    """Упаковка зашифрованных данных в PNG изображение."""
+def encode_data_to_image(data_bytes: bytes, password: str, extension: str, iterations: int, output_filename: str):
+    print(f"🔐 Генерация ключа ({iterations:,} итераций)...")
+    encrypted = encrypt_data(data_bytes, password, extension, iterations)
     
-    print("🔐 Генерация ключа (это займёт ~1 сек)...")
-    encrypted = encrypt_data(data_bytes, password)
-    
-    # Расчёт размера квадратного изображения
     total_bytes = len(encrypted)
     required_pixels = math.ceil(total_bytes / 3)
     side = int(math.ceil(math.sqrt(required_pixels)))
     
     if side > 2000:
-        print(f"⚠️  Предупреждение: размер {side}x{side} может быть сжат мессенджерами!")
+        print(f"⚠️  Внимание: размер {side}x{side} может сжиматься мессенджерами!")
     
-    # Заполняем остаток СЛУЧАЙНЫМИ байтами (не нулями - маскировка)
     padding_size = side * side * 3 - total_bytes
     full_data = encrypted + secrets.token_bytes(padding_size)
     
-    # Формируем пиксели RGB
     pixels = [
         (full_data[i], full_data[i+1], full_data[i+2]) 
         for i in range(0, len(full_data), 3)
@@ -181,121 +153,232 @@ def encode_data_to_image(data_bytes: bytes, password: str, output_filename: str 
     img.putdata(pixels)
     img.save(output_filename, "PNG", compress_level=9)
     
-    print(f"✅ Сохранено: {output_filename}")
-    print(f"   Размер: {side}×{side} пикселей")
-    print(f"   Данные: {len(data_bytes)} → {len(encrypted)} байт (зашифровано)")
+    print(f"✅ Успешно! Файл сохранён: {output_filename}")
+    print(f"   Размер: {side}×{side} px | Данные: {len(data_bytes):,} байт")
 
 
-def decode_data_from_image(image_path: str, password: str) -> Tuple[Optional[bytes], Optional[str]]:
-    """Извлечение и расшифровка данных из PNG изображения."""
-    
+def decode_data_from_image(image_path: str, password: str) -> Tuple[Optional[bytes], str, Optional[str]]:
     try:
         img = Image.open(image_path).convert('RGB')
-    except FileNotFoundError:
-        return None, f"Файл не найден: {image_path}"
     except Exception as e:
-        return None, f"Ошибка открытия изображения: {e}"
+        return None, "", f"Ошибка открытия: {e}"
     
-    # Извлекаем байты из пикселей
     raw_bytes = bytearray()
     for pixel in img.getdata():
-        raw_bytes.extend(pixel[:3])  # Только RGB, игнорируем альфа-канал
+        raw_bytes.extend(pixel[:3])
     
-    print("🔐 Расшифровка (это займёт ~1 сек)...")
+    print("🔐 Расшифровка...")
     return decrypt_data(bytes(raw_bytes), password)
 
 
 # ══════════════════════════════════════════════════════════════
-#                    ИНТЕРФЕЙС КОМАНДНОЙ СТРОКИ
+#                    ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ══════════════════════════════════════════════════════════════
+
+def generate_password(length: int = 20) -> str:
+    """Генерация криптографически стойкого пароля."""
+    return secrets.token_urlsafe(length)
+
+
+def get_password(for_encryption: bool = True) -> str:
+    """
+    Запрос пароля с опцией автогенерации.
+    
+    Args:
+        for_encryption: True = шифрование (можно генерировать), 
+                       False = расшифровка (нужен существующий)
+    """
+    if for_encryption:
+        prompt = "🔑 Пароль (Enter = сгенерировать случайный): "
+    else:
+        prompt = "🔑 Пароль: "
+    
+    password = input(prompt).strip()
+    
+    if not password:
+        if for_encryption:
+            # Генерируем случайный пароль
+            password = generate_password()
+            print()
+            print("   ╔════════════════════════════════════════════╗")
+            print(f"   ║  СГЕНЕРИРОВАННЫЙ ПАРОЛЬ:                   ║")
+            print(f"   ║  {password:<40} ║")
+            print("   ╠════════════════════════════════════════════╣")
+            print("   ║  ⚠️  СОХРАНИТЕ ЕГО! Восстановить нельзя!   ║")
+            print("   ╚════════════════════════════════════════════╝")
+            print()
+        else:
+            # Для расшифровки пустой пароль недопустим
+            print("❌ Пароль не может быть пустым!")
+            return ""
+    
+    return password
+
+
+def get_iterations() -> int:
+    """Запрос итераций с валидацией."""
+    print(f"\n⚙️  Итерации PBKDF2 (Enter = {DEFAULT_ITERATIONS:,}):")
+    print(f"   Диапазон: {MIN_ITERATIONS:,} — {MAX_ITERATIONS:,}")
+    val = input("   Ввод: ").strip()
+    
+    if not val:
+        return DEFAULT_ITERATIONS
+    
+    try:
+        iters = int(val.replace('_', '').replace(' ', '').replace(',', ''))
+        
+        if iters < MIN_ITERATIONS:
+            print(f"   ⚠️  Минимум {MIN_ITERATIONS:,}. Установлено: {MIN_ITERATIONS:,}")
+            return MIN_ITERATIONS
+        
+        if iters > MAX_ITERATIONS:
+            print(f"   ⚠️  Максимум {MAX_ITERATIONS:,}. Установлено: {MAX_ITERATIONS:,}")
+            return MAX_ITERATIONS
+        
+        return iters
+        
+    except ValueError:
+        print(f"   ⚠️  Ошибка ввода. Используется: {DEFAULT_ITERATIONS:,}")
+        return DEFAULT_ITERATIONS
+
+
+def pause_exit(code: int = 0):
+    """Пауза перед выходом для .exe"""
+    print("\n" + "═" * 45)
+    input("Нажмите Enter для выхода...")
+    sys.exit(code)
+
+
+# ══════════════════════════════════════════════════════════════
+#                    ГЛАВНЫЙ ИНТЕРФЕЙС
 # ══════════════════════════════════════════════════════════════
 
 def main():
-    print("═" * 55)
-    print("  🔒 Улучшенный Пиксельный Кодировщик v2.0")
-    print("     AES-256-GCM │ PBKDF2 │ Salt │ Nonce")
-    print("═" * 55)
-    
-    print("\n[1] Закодировать данные в изображение")
-    print("[2] Раскодировать данные из изображения")
-    mode = input("\nВыбор: ").strip()
-
-    if mode == "1":
-        # === КОДИРОВАНИЕ ===
-        print("\n┌─ Тип данных ─────────────────┐")
-        print("│ [1] Текст                    │")
-        print("│ [2] Файл (любой)             │")
-        print("└──────────────────────────────┘")
-        type_choice = input("Выбор: ").strip()
+    try:
+        print("═" * 55)
+        print("  🔒 PixelEncoder v3.1")
+        print("     AES-256-GCM │ PBKDF2 │ Auto-Extension")
+        print("═" * 55)
         
-        if type_choice == "2":
-            file_path = input("📁 Путь к файлу: ").strip().strip('"\'')
-            try:
+        print("\n[1] Закодировать данные в картинку")
+        print("[2] Раскодировать данные из картинки")
+        mode = input("\nВыбор: ").strip()
+
+        if mode == "1":
+            # ═══════════════════════════════════════════
+            #              КОДИРОВАНИЕ
+            # ═══════════════════════════════════════════
+            print("\n┌─ Тип данных ─────────────────┐")
+            print("│ [1] Текст                    │")
+            print("│ [2] Файл (любой)             │")
+            print("└──────────────────────────────┘")
+            type_choice = input("Выбор: ").strip()
+            
+            data = b""
+            extension = ""
+            
+            if type_choice == "2":
+                file_path = input("\n📁 Перетащите файл сюда: ").strip().strip('"\'')
+                
+                if not os.path.exists(file_path):
+                    print("❌ Файл не найден!")
+                    pause_exit(1)
+                
+                _, extension = os.path.splitext(file_path)
+                
                 with open(file_path, 'rb') as f:
                     data = f.read()
-                print(f"   Загружено: {len(data):,} байт")
-            except FileNotFoundError:
+                
+                print(f"   ✓ Загружен: {os.path.basename(file_path)}")
+                print(f"   ✓ Размер: {len(data):,} байт")
+                print(f"   ✓ Расширение: {extension if extension else '(нет)'}")
+            else:
+                text = input("\n📝 Введите текст: ")
+                data = text.encode('utf-8')
+                extension = ".txt"
+                print(f"   ✓ Размер: {len(data):,} байт")
+
+            # Запрос пароля (с автогенерацией)
+            print()
+            password = get_password(for_encryption=True)
+            if not password:
+                pause_exit(1)
+
+            # Запрос итераций
+            iters = get_iterations()
+            
+            # Имя выходного файла
+            out_name = input("\n💾 Имя картинки (Enter = encoded.png): ").strip()
+            if not out_name:
+                out_name = "encoded.png"
+            if not out_name.lower().endswith('.png'):
+                out_name += '.png'
+            
+            print()
+            encode_data_to_image(data, password, extension, iters, out_name)
+
+        elif mode == "2":
+            # ═══════════════════════════════════════════
+            #              ДЕКОДИРОВАНИЕ
+            # ═══════════════════════════════════════════
+            path = input("\n🖼️  Перетащите картинку сюда: ").strip().strip('"\'')
+            
+            if not os.path.exists(path):
                 print("❌ Файл не найден!")
-                return
-            except Exception as e:
-                print(f"❌ Ошибка: {e}")
-                return
-        else:
-            text = input("📝 Введите текст: ")
-            data = text.encode('utf-8')
-            print(f"   Размер: {len(data):,} байт")
+                pause_exit(1)
 
-        password = input("🔑 Пароль (Enter = сгенерировать): ").strip()
-        if not password:
-            password = secrets.token_urlsafe(16)
-            print(f"\n   ╔══════════════════════════════════╗")
-            print(f"   ║ СГЕНЕРИРОВАННЫЙ ПАРОЛЬ:          ║")
-            print(f"   ║ {password:<32} ║")
-            print(f"   ╚══════════════════════════════════╝")
-            print("   ⚠️  Сохраните пароль! Восстановить невозможно!\n")
-        
-        out_name = input("💾 Имя файла (Enter = encoded.png): ").strip()
-        if not out_name:
-            out_name = "encoded.png"
-        if not out_name.lower().endswith('.png'):
-            out_name += '.png'
+            password = get_password(for_encryption=False)
+            if not password:
+                pause_exit(1)
             
-        encode_data_to_image(data, password, out_name)
+            content, ext, error = decode_data_from_image(path, password)
+            
+            if error:
+                print(f"\n❌ ОШИБКА: {error}")
+                pause_exit(1)
+            
+            print(f"\n✅ Расшифровано успешно!")
+            print(f"   Размер: {len(content):,} байт")
+            print(f"   Тип: {ext if ext else 'неизвестно'}")
+            
+            print("\n┌─ Что делать с данными? ──────┐")
+            print("│ [1] Сохранить в файл         │")
+            print("│ [2] Показать как текст       │")
+            print("└──────────────────────────────┘")
+            action = input("Выбор: ").strip()
+            
+            if action == "2":
+                try:
+                    print("\n" + "─" * 45)
+                    print(content.decode('utf-8'))
+                    print("─" * 45)
+                except UnicodeDecodeError:
+                    print("⚠️  Бинарные данные — сохраняю в файл...")
+                    action = "1"
+            
+            if action == "1":
+                # Формируем имя по умолчанию
+                default_name = f"restored{ext}" if ext else "restored.bin"
+                save_name = input(f"\n💾 Имя файла (Enter = {default_name}): ").strip()
+                
+                if not save_name:
+                    save_name = default_name
+                
+                with open(save_name, 'wb') as f:
+                    f.write(content)
+                
+                abs_path = os.path.abspath(save_name)
+                print(f"\n✅ Сохранено: {abs_path}")
 
-    elif mode == "2":
-        # === ДЕКОДИРОВАНИЕ ===
-        path = input("🖼️  Путь к картинке: ").strip().strip('"\'')
-        password = input("🔑 Пароль: ").strip()
-        
-        result_bytes, error = decode_data_from_image(path, password)
-        
-        if error:
-            print(f"\n❌ ОШИБКА: {error}")
-            return
-            
-        print(f"\n✅ Успешно расшифровано: {len(result_bytes):,} байт")
-        
-        print("\n┌─ Сохранение результата ──────┐")
-        print("│ [1] Показать как текст       │")
-        print("│ [2] Сохранить в файл         │")
-        print("└──────────────────────────────┘")
-        save_mode = input("Выбор: ").strip()
-        
-        if save_mode == "2":
-            ext = input("📄 Расширение файла (jpg/png/zip/pdf/...): ").strip().lstrip('.')
-            save_path = f"restored.{ext}" if ext else "restored.bin"
-            with open(save_path, 'wb') as f:
-                f.write(result_bytes)
-            print(f"💾 Файл сохранён: {save_path}")
         else:
-            try:
-                print("\n" + "─" * 40)
-                print(result_bytes.decode('utf-8'))
-                print("─" * 40)
-            except UnicodeDecodeError:
-                print("❌ Данные не являются текстом UTF-8.")
-                print("   Используйте опцию [2] для сохранения в файл.")
-    else:
-        print("❌ Неверный выбор")
+            print("❌ Неверный выбор. Введите 1 или 2.")
+
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Прервано пользователем (Ctrl+C)")
+    except Exception as e:
+        print(f"\n❌ Ошибка: {e}")
+    finally:
+        pause_exit()
 
 
 if __name__ == "__main__":

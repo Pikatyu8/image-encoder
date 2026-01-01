@@ -40,6 +40,10 @@ KEY_SIZE = 32
 HASH_SIZE = 32
 FORMAT_VERSION = 5
 
+KEY_SIZE_MIN = 4
+KEY_SIZE_MAX = 100
+KEY_SIZE_DEFAULT = 4
+
 ARGON2_DEFAULTS = {
     "time_cost": 3,
     "memory_cost": 65536,
@@ -210,6 +214,12 @@ def load_from_png(path: Path) -> bytes:
         img = img.convert('RGB')
         return img.tobytes()
 
+def generate_key_image(size: int) -> Image.Image:
+    """Генерирует изображение с криптографически случайными пикселями."""
+    entropy_bytes = size * size * 3
+    data = secrets.token_bytes(entropy_bytes)
+    return Image.frombytes('RGB', (size, size), data)
+
 # ══════════════════════════════════════════════════════════════
 #                    INTERACTIVE MODE
 # ══════════════════════════════════════════════════════════════
@@ -238,7 +248,7 @@ def interactive_menu() -> str:
     table.add_row("[1]", "🔐 Encode - Зашифровать данные в изображение")
     table.add_row("[2]", "🔓 Decode - Расшифровать данные из изображения")
     table.add_row("[3]", "🔑 KeyGen - Сгенерировать ключ-файл")
-    table.add_row("[4]", "ℹ️  Info   - Информация о программе")
+    table.add_row("[4]", "📖 Info   - Информация о программе")
     table.add_row("[0]", "🚪 Exit   - Выход")
     
     console.print(Panel(table, title="[bold]Главное меню[/bold]", border_style="blue"))
@@ -267,7 +277,6 @@ def interactive_encode():
     extension = ".txt"
     
     if data_type == "file":
-        # Ввод пути к файлу
         while True:
             file_path_str = Prompt.ask("  [cyan]Путь к файлу[/cyan]")
             file_path = Path(file_path_str).expanduser().resolve()
@@ -281,8 +290,7 @@ def interactive_encode():
             else:
                 console.print(f"  [red]✗ Файл не найден: {file_path}[/red]")
     else:
-        # Ввод текста
-        console.print("  [dim]Введите текст (для многострочного ввода заверите пустой строкой):[/dim]")
+        console.print("  [dim]Введите текст (для многострочного ввода завершите пустой строкой):[/dim]")
         lines = []
         while True:
             line = Prompt.ask("  ", default="")
@@ -290,7 +298,6 @@ def interactive_encode():
                 break
             lines.append(line)
             if len(lines) == 1 and line != "":
-                # Однострочный режим - сразу выходим
                 if not Confirm.ask("  Добавить ещё строки?", default=False):
                     break
         
@@ -570,7 +577,6 @@ def interactive_decode():
             border_style="green"
         ))
         
-        # Предложить открыть/показать содержимое для текстовых файлов
         if payload.extension in ['.txt', '.md', '.json', '.xml', '.csv']:
             if Confirm.ask("  Показать содержимое?", default=False):
                 try:
@@ -588,35 +594,56 @@ def interactive_decode():
     except Exception as e:
         console.print(f"[bold red]Непредвиденная ошибка:[/bold red] {e}")
 
-def _interactive_keygen_helper(output_path: Path, size: int = 256):
+def _interactive_keygen_helper(output_path: Path, size: int = KEY_SIZE_DEFAULT):
     """Вспомогательная функция генерации ключа."""
-    entropy_bytes = size * size * 3
-    data = secrets.token_bytes(entropy_bytes)
-    img = Image.frombytes('RGB', (size, size), data)
-    
+    img = generate_key_image(size)
     target = output_path.with_suffix('.png')
     img.save(target, format="PNG")
     
-    console.print(f"  [green]✓[/green] Ключ-файл создан: {target}")
+    entropy_bytes = size * size * 3
+    console.print(f"  [green]✓[/green] Ключ-файл создан: {target} ({entropy_bytes} байт энтропии)")
     return target
 
 def interactive_keygen():
     """Интерактивный режим генерации ключа."""
     console.print("\n[bold blue]═══ ГЕНЕРАЦИЯ КЛЮЧ-ФАЙЛА ═══[/bold blue]\n")
     
+    # Пояснение
+    console.print(Panel(
+        "[dim]Изображение 4×4 уже содержит 48 байт (384 бита) случайных данных.\n"
+        "Для AES-256 требуется всего 256 бит, поэтому бОльшие размеры\n"
+        "не повышают криптографическую стойкость.[/dim]",
+        title="💡 Почему 4×4 достаточно?",
+        border_style="dim"
+    ))
+    
     # Размер
-    console.print("[bold]Шаг 1/2:[/bold] Выберите размер ключа")
+    console.print("\n[bold]Шаг 1/2:[/bold] Размер ключ-изображения")
     
     size_table = Table(box=box.SIMPLE, show_header=False)
-    size_table.add_row("[1]", "128x128", "[dim]~48 KB, быстро[/dim]")
-    size_table.add_row("[2]", "256x256", "[dim]~192 KB, рекомендуется[/dim]")
-    size_table.add_row("[3]", "512x512", "[dim]~768 KB, высокая энтропия[/dim]")
-    size_table.add_row("[4]", "1024x1024", "[dim]~3 MB, максимум[/dim]")
+    size_table.add_row("[1]", "4×4", "[green]48 байт — рекомендуется[/green]")
+    size_table.add_row("[2]", "Свой размер", f"[dim]от {KEY_SIZE_MIN} до {KEY_SIZE_MAX}[/dim]")
     console.print(size_table)
     
-    size_choice = Prompt.ask("  Размер", choices=["1", "2", "3", "4"], default="2")
-    sizes = {"1": 128, "2": 256, "3": 512, "4": 1024}
-    size = sizes[size_choice]
+    size_choice = Prompt.ask("  Выбор", choices=["1", "2"], default="1")
+    
+    if size_choice == "1":
+        size = KEY_SIZE_DEFAULT
+    else:
+        while True:
+            size = IntPrompt.ask(f"  Размер стороны квадрата (минимум {KEY_SIZE_MIN})", default=KEY_SIZE_DEFAULT)
+            
+            if size < KEY_SIZE_MIN:
+                console.print(f"  [yellow]⚠ Минимальный размер: {KEY_SIZE_MIN}[/yellow]")
+                continue
+            elif size > KEY_SIZE_MAX:
+                console.print(f"  [yellow]⚠ Максимальный размер: {KEY_SIZE_MAX} (больше не имеет смысла)[/yellow]")
+                continue
+            else:
+                break
+    
+    entropy_bytes = size * size * 3
+    console.print(f"  [dim]Выбрано: {size}×{size} = {entropy_bytes} байт ({entropy_bytes * 8} бит) энтропии[/dim]")
     
     # Путь
     console.print("\n[bold]Шаг 2/2:[/bold] Куда сохранить ключ?")
@@ -634,17 +661,14 @@ def interactive_keygen():
     
     # Генерация
     try:
-        entropy_bytes = size * size * 3
-        data = secrets.token_bytes(entropy_bytes)
-        img = Image.frombytes('RGB', (size, size), data)
-        
+        img = generate_key_image(size)
         target = output_path.with_suffix('.png')
         img.save(target, format="PNG")
         
         console.print(Panel(
             f"[bold green]✓ Ключ-файл создан![/bold green]\n\n"
             f"📁 Путь: [cyan]{target.resolve()}[/cyan]\n"
-            f"📊 Размер: {size}x{size} пикселей\n"
+            f"📐 Размер: {size}×{size} пикселей\n"
             f"🔐 Энтропия: {entropy_bytes} байт ({entropy_bytes * 8} бит)",
             title="KeyGen",
             border_style="green"
@@ -682,9 +706,6 @@ def show_info():
   python pixel_encoder.py encode --file secret.pdf --password "mypass"
   python pixel_encoder.py decode image.png --password "mypass"
   python pixel_encoder.py keygen key.png
-
-[bold]Автор:[/bold] PixelEncoder Team
-[bold]Лицензия:[/bold] MIT
     """
     console.print(Panel(info_text, title="О программе", border_style="blue"))
 
@@ -726,21 +747,32 @@ def interactive():
 @app.command()
 def keygen(
     output: Annotated[Path, typer.Argument(help="Output path for key file")] = Path("key.png"),
-    size: int = 256
+    size: Annotated[int, typer.Option("--size", "-s", help=f"Side size ({KEY_SIZE_MIN}-{KEY_SIZE_MAX})")] = KEY_SIZE_DEFAULT
 ):
     """🔑 Generate a high-entropy noise image to act as a key-file."""
+    
+    # Валидация размера
+    original_size = size
+    if size < KEY_SIZE_MIN:
+        console.print(f"[yellow]Minimum size is {KEY_SIZE_MIN}. Using {KEY_SIZE_MIN}.[/yellow]")
+        size = KEY_SIZE_MIN
+    elif size > KEY_SIZE_MAX:
+        console.print(f"[yellow]Maximum size is {KEY_SIZE_MAX} (larger is pointless for crypto). Using {KEY_SIZE_MAX}.[/yellow]")
+        size = KEY_SIZE_MAX
+    
     try:
-        entropy_bytes = size * size * 3
-        data = secrets.token_bytes(entropy_bytes)
-        img = Image.frombytes('RGB', (size, size), data)
-        
+        img = generate_key_image(size)
         target = output.with_suffix('.png')
         img.save(target, format="PNG")
+        
+        entropy_bytes = size * size * 3
         
         console.print(Panel(
             f"[green]Key file generated successfully![/green]\n"
             f"Path: {target.resolve()}\n"
-            f"Entropy: {entropy_bytes} bytes", 
+            f"Size: {size}×{size} pixels\n"
+            f"Entropy: {entropy_bytes} bytes ({entropy_bytes * 8} bits)\n\n"
+            f"[dim]Note: 6×6 (108 bytes) is already more than enough for AES-256.[/dim]", 
             title="KeyGen"
         ))
     except Exception as e:
@@ -887,7 +919,6 @@ def main(ctx: typer.Context):
     Запустите без аргументов для интерактивного режима.
     """
     if ctx.invoked_subcommand is None:
-        # Если команда не указана - запускаем интерактивный режим
         run_interactive_mode()
 
 if __name__ == "__main__":

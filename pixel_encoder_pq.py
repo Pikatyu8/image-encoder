@@ -80,7 +80,7 @@ MAX_INPUT_SIZE = 100 * 1024 * 1024
 # Запрещённые символы в именах файлов (кроссплатформенно)
 _UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
-app = typer.Typer(help="PixelEncoder v6.2: Post-Quantum Steganography Tool")
+app = typer.Typer(help="PixelEncoder v6.2: Post-Quantum Ciphering Tool")
 console = Console()
 
 # ══════════════════════════════════════════════════════════════
@@ -415,7 +415,7 @@ def show_banner():
 ║ |  __/| |>  <  __/ | |___| | | | (_| (_) | (_| |  __/ |       ║
 ║ |_|   |_/_/\\_\\___|_|_____|_| |_|\\___\\___/ \\__,_|\\___|_|       ║
 ║                                                               ║
-║          v{APP_VERSION} - Post-Quantum Steganography                  ║
+║          v{APP_VERSION} - Post-Quantum Ciphering                      ║
 ╚═══════════════════════════════════════════════════════════════╝
     """
     console.print(banner, style="bold cyan")
@@ -650,7 +650,7 @@ def interactive_keygen():
 
 def show_info():
     info_text = f"""[bold cyan]PixelEncoder v{APP_VERSION}[/bold cyan]
-Post-Quantum Steganography Tool
+Post-Quantum Ciphering Tool
 
 [bold]Алгоритмы защиты:[/bold]
 • [cyan]ML-KEM-768 (FIPS 203)[/cyan] — Постквантовая KEM через liboqs
